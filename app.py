@@ -6,6 +6,9 @@ import numpy as np
 import librosa
 import joblib
 import warnings
+import tempfile
+import os
+import random
 
 # Ignore warnings for a cleaner UI
 warnings.filterwarnings("ignore")
@@ -43,8 +46,11 @@ class LanguageCNN(nn.Module):
 # ==========================================
 @st.cache_resource
 def load_models():
+    # Force PyTorch to be perfectly deterministic across different servers
+    # This ensures math operations output the exact same numbers on Cloud vs PC
+    torch.use_deterministic_algorithms(True)
+    
     # --- Load CNN Model ---
-    # Exact path provided by user
     cnn_path = 'models/cnn_language_model4.pt'
     cnn_model = LanguageCNN(num_classes=3)
     checkpoint = torch.load(cnn_path, map_location='cpu', weights_only=False)
@@ -53,7 +59,6 @@ def load_models():
     le_cnn = checkpoint["encoder"]
     
     # --- Load GMM Model ---
-    # Exact path provided by user
     gmm_path = 'models/gmm_language_model (3).pkl'
     gmm_data = joblib.load(gmm_path)
     gmm_models = gmm_data["models"]
@@ -63,12 +68,12 @@ def load_models():
 
 # ==========================================
 # 3. CNN Feature Extraction Pipeline
-# Safe pipeline for external audio
+# Bulletproof loading to match training environment exactly
 # ==========================================
 def extract_cnn_features(audio, sr):
     audio = np.array(audio, dtype=np.float32)
     
-    # 1. Resample to 16kHz
+    # 1. Resample to 16kHz (Safety check, usually handled in librosa.load now)
     if sr != 16000:
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
         sr = 16000
@@ -112,108 +117,95 @@ def extract_cnn_features(audio, sr):
     features = np.stack([fix_frames(mel_db), fix_frames(mfcc_stack)], axis=0)
     return features
 
-
 # ==========================================
-# 4. GMM Preprocessing Pipeline
-# Extracted EXACTLY from the provided GMM training script
+# 4. GMM Preprocessing & Feature Extraction
+# (Strictly matches the training notebook)
 # ==========================================
 def preprocess_gmm_audio(audio, sr):
-    # 1. Resample to target sampling rate
     if sr != 16000:
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
         sr = 16000
-
-    # 2. Remove DC offset
     audio = audio - np.mean(audio)
-
-    # 3. Apply pre-emphasis filter
     audio = np.append(audio[0], audio[1:] - 0.97 * audio[:-1])
-
-    # 4. Remove silent parts of the signal
     intervals = librosa.effects.split(audio, top_db=25)
     if len(intervals) > 0:
         audio = np.concatenate([audio[start:end] for start, end in intervals])
-
-    # 5. Normalize amplitude to range [-1, 1]
     audio = audio / (np.max(np.abs(audio)) + 1e-9)
-
-    # 6. Ensure fixed length (Pad at the END, like in training)
     target_len = sr * 6
     if len(audio) < target_len:
         audio = np.pad(audio, (0, target_len - len(audio)), mode='reflect')
     else:
         audio = audio[:target_len]
-
     return audio, sr
 
-# ==========================================
-# 5. GMM Feature Extraction Pipeline
-# Extracted EXACTLY from the provided GMM training script
-# ==========================================
 def normalize_feature(feature):
     mean = np.mean(feature)
     std = np.std(feature)
-    if std == 0:
-        return feature - mean
+    if std == 0: return feature - mean
     return (feature - mean) / std
 
 def extract_gmm_features(audio, sr):
-    # Step 1: Preprocess (Exactly matching training order)
     audio, sr = preprocess_gmm_audio(audio, sr)
-
-    # Step 2: Extract raw features
     mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
     delta = librosa.feature.delta(mfcc)
     delta2 = librosa.feature.delta(mfcc, order=2)
     zcr = librosa.feature.zero_crossing_rate(audio)
     centroid = librosa.feature.spectral_centroid(y=audio, sr=sr)
-
-    # Step 3: Normalize each feature separately
     mfcc = normalize_feature(mfcc)
     delta = normalize_feature(delta)
     delta2 = normalize_feature(delta2)
     zcr = normalize_feature(zcr)
     centroid = normalize_feature(centroid)
-
-    # Step 4: Stack into shape (41, T) -> Transpose to (T, 41)
-    features = np.vstack([mfcc, delta, delta2, zcr, centroid])
-    
-    return features.T
-
+    features = np.vstack([mfcc, delta, delta2, zcr, centroid]).T
+    return features
 
 # ==========================================
-# 6. Streamlit User Interface
+# 5. Streamlit User Interface
 # ==========================================
 st.set_page_config(page_title="Language ID App", layout="wide")
 
 st.title("🗣️ Spoken Language Identification System")
-st.markdown("Compare **CNN** and **GMM** model predictions in real-time. Upload a file or use your microphone.")
+st.markdown("Compare **CNN** and **GMM** model predictions. Upload an audio file (WAV, MP3, M4A, etc.).")
 
 # Load models once
 cnn_model, le_cnn, gmm_models, le_gmm = load_models()
 
-# Create Tabs for User Input
-tab1, tab2 = st.tabs(["📁 Upload Audio File", "🎤 Record from Microphone"])
+# File Upload Section
+uploaded_file = st.file_uploader(
+    "Choose an audio file", 
+    type=["wav", "mp3", "m4a", "ogg", "flac"], 
+    key="file_uploader"
+)
 
 audio = None
 sr = None
 
-# Tab 1: File Upload
-with tab1:
-    uploaded_file = st.file_uploader("Choose an audio file (WAV/MP3)", type=["wav", "mp3"], key="file_uploader")
-    if uploaded_file is not None:
-        st.audio(uploaded_file, format='audio/wav')
-        audio, sr = librosa.load(uploaded_file, sr=None)
+if uploaded_file is not None:
+    # Display the audio player
+    st.audio(uploaded_file)
+    
+    try:
+        # ROBUST FORMAT HANDLING:
+        # Save to a temporary file first. This bypasses OS-level decoding 
+        # errors and handles all formats safely.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp_path = tmp.name
+            tmp.write(uploaded_file.read())
+        
+        # Force exact training format (Mono, 16kHz) regardless of file type
+        # This is the key fix for PC vs Cloud discrepancies
+        audio, sr = librosa.load(tmp_path, sr=16000, mono=True)
+        
+        # Delete the temporary file to save server space
+        os.remove(tmp_path)
+        
+    except Exception as e:
+        # Catch any decoding errors and show a friendly message instead of crashing
+        st.error(f"❌ Error processing audio file: {e}")
+        st.info("Please try converting your file to a standard .wav format and upload again.")
+        audio = None # Set to None so the prediction blocks don't run
 
-# Tab 2: Microphone Recording
-with tab2:
-    st.info("Click below to start recording. Speak clearly, then click stop.")
-    mic_audio = st.audio_input("Record your voice", key="mic_recorder")
-    if mic_audio is not None:
-        st.success("Recording saved! Processing...")
-        audio, sr = librosa.load(mic_audio, sr=None)
-
-# If audio is provided, run predictions
+# If audio is successfully loaded, run predictions
 if audio is not None:
     
     col1, col2 = st.columns(2)
@@ -241,10 +233,7 @@ if audio is not None:
     with col2:
         st.subheader("📊 GMM Model Prediction")
         with st.spinner('Analyzing with GMM...'):
-            # Extract features (Returns shape T x 41)
             feats_gmm = extract_gmm_features(audio, sr)
-            
-            # Calculate mean Log-Likelihood for each of the 3 models
             scores = [
                 gmm_models[i].score_samples(feats_gmm).mean() 
                 for i in range(len(gmm_models))
@@ -252,7 +241,6 @@ if audio is not None:
             pred_id_gmm = int(np.argmax(scores))
             lang_gmm = le_gmm.inverse_transform([pred_id_gmm])[0]
             
-            # Convert scores to readable percentages
             scores_arr = np.array(scores)
             exp_scores = np.exp(scores_arr - np.max(scores_arr))
             probs_gmm = exp_scores / exp_scores.sum()
