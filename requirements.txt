@@ -1,0 +1,5 @@
+streamlit
+torch
+librosa
+scikit-learn
+numpy
